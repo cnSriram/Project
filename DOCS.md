@@ -79,5 +79,5 @@ The service is optimized to deliver results in less than 1 second, even for "col
 ## 5. Deployment for Friends
 When exposing this API to other developers:
 - Ensure `allow_origins=["*"]` is set in CORS (default).
-- Provide the `.env.example` file for their own configuration.
+- Provide the `.env.sample` file for their own configuration.
 - Recommend using a production ASGI server like `uvicorn` with multiple workers.
