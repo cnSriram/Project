@@ -1,50 +1,54 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pymongo import MongoClient
-from rapidfuzz import process, fuzz
+import asyncio
+import time
 from datetime import datetime
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 
-# 1. Initialize and Security
-load_dotenv()
-app = FastAPI()
+# Import your IGDB Service
+from igdb_service import IGDBService
 
-# Enable CORS so the Frontend/Express can talk to Python
+# --- 1. INITIALIZATION & SETUP ---
+load_dotenv(find_dotenv())
+app = FastAPI(title="Game Search API - Multi-User Edition")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"], # We only need GET for searching
+    allow_origins=["*"], # Allows your friend's website to call this API
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-# 2. MongoDB Connection
-# Ensure your .env has: MONGO_URI=mongodb://...
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
+# Connections
+client = AsyncIOMotorClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
 db = client['gamesDB']
 collection = db['fitgirl-games']
+igdb = IGDBService() # Initialize IGDB
 
-try:
-    # This "pings" the database to see if it's alive
-    client.admin.command('ping')
-    print("✅ MongoDB Connection Successful!")
-except Exception as e:
-    print(f"❌ MongoDB Connection Failed: {e}")
+async def verify_mongo():
+    try:
+        await client.admin.command('ping')
+        print("[INFO] MongoDB Connection Successful!")
+    except Exception as e:
+        print(f"[ERROR] MongoDB Connection Failed: {e}")
 
-# 3. Global Memory Cache (For instant results)
-print("⚡ Initializing Search Cache...")
-ALL_GAMES = list(collection.find({}, {"gameName": 1, "_id": 0}))
-CACHED_NAMES = [g['gameName'] for g in ALL_GAMES if 'gameName' in g]
-print(f"✅ Cache Ready: {len(CACHED_NAMES)} games loaded.")
+@app.on_event("startup")
+async def startup_event():
+    # We create the ping task to run in the background once the loop is ready
+    asyncio.create_task(verify_mongo())
 
-# 1. Load and Map the Cache (Run this at startup)
-# This creates a dictionary mapping 'lowercase_name': 'Original Name'
-ALL_GAMES_RAW = list(collection.find({}, {"gameName": 1, "_id": 0}))
-NAME_MAP = {g['gameName'].lower(): g['gameName'] for g in ALL_GAMES_RAW if 'gameName' in g}
-CACHED_NAMES_LOWER = list(NAME_MAP.keys())
+# --- 2. CACHE & INDEXING ---
+# We no longer need to load all games into memory or use local NLP models.
+# MongoDB Atlas Search handles this far more efficiently.
+print("[INFO] Server initialized with Atlas Search support.")
 
-ACRONYMS = {
+# --- 3. UTILITY FUNCTIONS ---
+# Extensive acronyms mapped to full names (Syncing with search_service.py)
+COMMON_ACRONYMS = {
     # Grand Theft Auto Series
     "gta": "Grand Theft Auto",
     "gta5": "Grand Theft Auto V",
@@ -94,81 +98,172 @@ ACRONYMS = {
     "sote": "Shadow of the Erdtree",
     "tlou": "The Last of Us",
     "tlou2": "The Last of Us: Part II",
-    "got": "Ghost of Tsushima", # Note: Also maps to 'Game of Thrones' but Ghost is more likely here
+    "got": "Ghost of Tsushima",
     "hks": "Hollow Knight: Silksong",
     "cyberpunk": "Cyberpunk 2077",
     "ts4": "The Sims 4",
     "nfs": "Need for Speed",
     "ets2": "Euro Truck Simulator 2",
+    "mk": "Mortal Kombat",
     "mk1": "Mortal Kombat 1",
     "mk11": "Mortal Kombat 11",
     "stalker2": "S.T.A.L.K.E.R. 2",
-    "bmw": "Black Myth: Wukong" # Common shorthand for Black Myth
+    "bmw": "Black Myth: Wukong"
 }
 
-# --- THE GET ROUTE ---
-@app.get("/nlp-search")
-async def nlp_search(q: str = ""):
-    """
-    Case-insensitive, acronym-aware fuzzy search for MongoDB games.
-    """
-    if not q or len(q) < 1:
-        return []
-
-    # --- STEP 1: NORMALIZE INPUT ---
-    # Force the user's messy input to lowercase
+def expand_query(q: str) -> str:
+    # Cleanup query
     query_clean = q.lower().strip()
     
-    # Check acronyms using the lowercase query
-    target = ACRONYMS.get(query_clean, query_clean).lower()
-
-    # --- STEP 2: FUZZY SEARCH (LOWERCASE VS LOWERCASE) ---
-    # We search against CACHED_NAMES_LOWER so casing never breaks the match
-    matches = process.extract(
-        target, 
-        CACHED_NAMES_LOWER, 
-        scorer=fuzz.token_set_ratio, # Best for titles with colons/subtitles
-        limit=15, 
-        score_cutoff=25
-    )
+    # Check for direct matches in the acronym map
+    if query_clean in COMMON_ACRONYMS:
+        return COMMON_ACRONYMS[query_clean]
     
-    results = []
-    for name_l, score, _ in matches:
-        # Retrieve the original correctly-cased name from our map
-        original_db_name = NAME_MAP[name_l]
-        doc = collection.find_one({"gameName": original_db_name})
+    # Otherwise check word by word
+    words = query_clean.split()
+    expanded = [COMMON_ACRONYMS.get(w, w) for w in words]
+    return " ".join(expanded)
+
+def serialize_doc(doc):
+    """Recursively serializes MongoDB documents for JSON output."""
+    if isinstance(doc, list):
+        return [serialize_doc(i) for i in doc]
+    if isinstance(doc, dict):
+        for key, value in doc.items():
+            if isinstance(value, ObjectId):
+                doc[key] = str(value)
+            elif isinstance(value, datetime):
+                doc[key] = value.isoformat()
+            elif isinstance(value, (dict, list)):
+                doc[key] = serialize_doc(value)
+    return doc
+
+# --- 4. ROUTES ---
+
+@app.get("/nlp-search")
+async def nlp_search(q: str = ""):
+    if not q or len(q.strip()) < 1:
+        return []
+
+    search_query = expand_query(q)
+    start_time = time.time()
+
+    # Using MongoDB Atlas Search ($search) with Compound Boosting
+    pipeline = [
+        {
+            "$search": {
+                "index": "default",
+                "compound": {
+                    "should": [
+                        {
+                            # 1. Exact Phrase Match (Highest priority)
+                            "phrase": {
+                                "query": search_query,
+                                "path": "gameName",
+                                "score": { "boost": { "value": 15 } }
+                            }
+                        },
+                        {
+                            # 2. Prefix Match (High priority for "start with")
+                            "wildcard": {
+                                "query": f"{search_query}*",
+                                "path": "gameName",
+                                "allowAnalyzedField": True,
+                                "score": { "boost": { "value": 10 } }
+                            }
+                        },
+                        {
+                            # 3. Text Match (Standard search)
+                            "text": {
+                                "query": search_query,
+                                "path": "gameName",
+                                "score": { "boost": { "value": 5 } }
+                            }
+                        },
+                        {
+                            # 4. Fuzzy Match (Typo tolerance)
+                            "text": {
+                                "query": search_query,
+                                "path": "gameName",
+                                "fuzzy": { "maxEdits": 1, "prefixLength": 2 },
+                                "score": { "boost": { "value": 2 } }
+                            }
+                        }
+                    ],
+                    "minimumShouldMatch": 1
+                }
+            }
+        },
+        { "$limit": 8 },
+        {
+            "$project": {
+                "score": { "$meta": "searchScore" },
+                "gameName": 1,
+                "repackSize": 1,
+                "downloadLinks": 1,
+                "genres": 1,
+            }
+        }
+    ]
+
+    try:
+        db_start = time.time()
+        # motor handles aggregate with an async for loop or to_list()
+        search_results = await collection.aggregate(pipeline).to_list(length=8)
+        db_time = time.time() - db_start
         
-        if doc:
-            # --- STEP 3: SERIALIZATION (JSON FIXES) ---
-            doc["_id"] = str(doc["_id"])
+        enrich_start = time.time()
+        async def enrich_result(doc):
+            doc = serialize_doc(doc)
+            # Alias score to search_score for legacy compatibility
+            doc["search_score"] = doc.get("score", 0)
             
-            # Convert any other ObjectIds (like downloadLinksId)
-            for key, value in doc.items():
-                if isinstance(value, ObjectId):
-                    doc[key] = str(value)
-            
-            # Format dates to ISO strings
-            for date_field in ["createdAt", "updatedAt"]:
-                if date_field in doc and isinstance(doc[date_field], datetime):
-                    doc[date_field] = doc[date_field].isoformat()
+            # Enrich with IGDB data
+            external_data = await igdb.fetch_game_metadata(doc["gameName"])
+            if external_data:
+                doc["cover_url"] = external_data.get("cover_url")
+                doc["rating"] = external_data.get("total_rating")
+            return doc
 
-            # --- STEP 4: DYNAMIC RANKING BOOST ---
-            final_score = score
-            
-            # Since both name_l and query_clean are lowercase, this is 100% reliable
-            if name_l.startswith(query_clean):
-                final_score += 100 # Priority for games starting with the search
-            elif query_clean in name_l:
-                final_score += 40 # Boost for partial matches
-            
-            doc["search_score"] = final_score
-            results.append(doc)
+        # Parallelize the enrichment calls
+        results = await asyncio.gather(*[enrich_result(doc) for doc in search_results])
+        enrich_time = time.time() - enrich_start
+        
+        # Limit to 6 results as per original search_service.py
+        results = results[:6]
+        
+        # Total performance logging
+        total_time = time.time() - start_time
+        print(f"[PERF] Search '{q}': DB {round(db_time*1000)}ms, Enrich {round(enrich_time*1000)}ms, Total {round(total_time*1000)}ms")
+        
+        return results
 
-    results.sort(key=lambda x: x["search_score"], reverse=True)
-    return results[:6]
+    except Exception as e:
+        print(f"Search Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
+# NEW ROUTE: For a "Game Details" page
+@app.get("/game/{game_id}")
+async def get_game_details(game_id: str):
+    try:
+        doc = await collection.find_one({"_id": ObjectId(game_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID format")
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    doc = serialize_doc(doc)
+    
+    # Deep enrichment for the detail page
+    external_data = await igdb.fetch_game_metadata(doc["gameName"])
+    if external_data:
+        doc["summary"] = external_data.get("summary")
+        doc["full_rating"] = external_data.get("total_rating")
+        doc["official_name"] = external_data.get("name")
+    
+    return doc
 
 if __name__ == "__main__":
     import uvicorn
-    # This runs the server on http://localhost:8000
-    uvicorn.run("search_service:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000) # host 0.0.0.0 allows external access
