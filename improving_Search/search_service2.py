@@ -36,8 +36,10 @@ async def verify_mongo():
     except Exception as e:
         print(f"[ERROR] MongoDB Connection Failed: {e}")
 
-# We create the ping task to run in the background
-asyncio.create_task(verify_mongo())
+@app.on_event("startup")
+async def startup_event():
+    # We create the ping task to run in the background once the loop is ready
+    asyncio.create_task(verify_mongo())
 
 # --- 2. CACHE & INDEXING ---
 # We no longer need to load all games into memory or use local NLP models.
